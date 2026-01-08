@@ -1,5 +1,19 @@
 # iRail Azure Pipeline (MVP)
 
+## Project Overview
+This project builds a simple cloud data pipeline on Microsoft Azure that fetches live train departure data from the iRail API, normalizes it, and stores it in an Azure SQL Database.
+
+## Tech Stack
+- **Language:** Python 3.11  
+- **Cloud:** Microsoft Azure (Functions, SQL Database)  
+- **API:** iRail (REST/JSON)  
+- **Orchestration:** Trigger-based (MVP) / Timer-based 
+
+## System Architecture
+<p align="center">
+  <img src="assets/Irail-db-layout.png" alt="Azure Data Pipeline Architecture" width="100%">
+</p>
+
 ## Project overview
 
 This project builds a simple cloud data pipeline on Microsoft Azure that:
@@ -8,6 +22,21 @@ This project builds a simple cloud data pipeline on Microsoft Azure that:
 - Normalizes the response into structured fields
 - Stores the data in an Azure SQL Database
 - Runs ingestion using an Azure Function (Python)
+# Repo structure
+
+``` bash 
+Irail-db
+├── .venv/
+├── .vscode/
+├── assets/
+├── .funcignore
+├── .gitignore
+├── function_app.py
+├── host.json
+├── local.settings.json
+├── README.md
+└── requirements.txt
+```
 
 ## Must-Have deliverables inlcuding
 
@@ -36,9 +65,10 @@ This MVP uses the following Azure services (created via Azure Portal):
 
 My Azure for Students subscription had limited region availability, so the resources were deployed in **Germany West Central** (closest available to Belgium in my subscription).
 
-## Database schema
+## Data Modeling
 
-The database is designed with a simple analytics-friendly structure.
+The database is designed using a **Star Schema** approach. This structure was chosen to follow industry best practices for analytical data, separating business **events** (facts) from descriptive **entities** (dimensions).
+
 
 ### DepartureFact
 
@@ -140,3 +170,9 @@ For this project, cloud-based testing was preferred once the core logic was stab
 - Build a live dashboard using Power BI
 - Analyze delay patterns by station, time, and train type
 - Prepare features for a future machine learning model to predict delays
+
+## 👥 Contributors
+
+This project is part of AI & Data Science Bootcamp training at **</becode** and it was done by: 
+
+- Welederufeal Tadege [LinkedIn](https://www.linkedin.com/in/) | [Github](https://github.com/welde2001-bot) 
