@@ -13,6 +13,13 @@ app = func.FunctionApp()
 IRAIL_LIVEBOARD_URL = "https://api.irail.be/liveboard/"
 IRAIL_STATIONS_URL = "https://api.irail.be/stations/"
 
+# Safe throttling under iRail limits (3 req/s). Use 2 req/s by default.
+REQUESTS_PER_SECOND = float(os.environ.get("IRAIL_RPS", "2.0"))
+SECONDS_PER_REQUEST = 1.0 / REQUESTS_PER_SECOND
+
+# How many stations to process per scheduled run
+BATCH_SIZE = int(os.environ.get("IRAIL_BATCH_SIZE", "30"))  # start small for stability
+
 
 # ----------------------------
 # Helpers
@@ -85,6 +92,13 @@ def _irail_headers() -> dict:
     return {"User-Agent": user_agent, "Accept": "application/json"}
 
 
+def _sleep_for_rate_limit(start_ts: float) -> None:
+    elapsed = time.time() - start_ts
+    remaining = SECONDS_PER_REQUEST - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 # ---- ETag cache helpers for Liveboard ----
 def _cache_key_liveboard(station: str, lang: str) -> str:
     return f"liveboard::{station}::{lang}"
@@ -126,7 +140,10 @@ def _irail_get_liveboard(station: str, lang: str, etag: str | None) -> requests.
 
     last_response: requests.Response | None = None
     for attempt in range(1, 4):
+        start_ts = time.time()
         r = requests.get(IRAIL_LIVEBOARD_URL, params=params, headers=headers, timeout=20)
+        _sleep_for_rate_limit(start_ts)
+
         last_response = r
 
         if r.status_code == 429:
@@ -147,7 +164,10 @@ def _irail_get_stations(lang: str) -> requests.Response:
 
     last_response: requests.Response | None = None
     for attempt in range(1, 4):
+        start_ts = time.time()
         r = requests.get(IRAIL_STATIONS_URL, params=params, headers=headers, timeout=30)
+        _sleep_for_rate_limit(start_ts)
+
         last_response = r
 
         if r.status_code == 429:
@@ -163,129 +183,45 @@ def _irail_get_stations(lang: str) -> requests.Response:
 
 
 # ----------------------------
-# Shared ingestion logic: DepartureFact
+# PipelineState (batch cursor)
 # ----------------------------
-def run_liveboard_sync(station_name: str, language: str) -> dict:
-    logging.info("Syncing liveboard for: %s [%s]", station_name, language)
+def _get_state(cur: pyodbc.Cursor, key: str, default: str) -> str:
+    cur.execute("SELECT state_value FROM dbo.PipelineState WHERE state_key = ?", key)
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else default
 
-    with _get_sql_connection() as conn:
-        cur = conn.cursor()
 
-        cache_key = _cache_key_liveboard(station_name, language)
-        last_etag = _get_cached_etag(cur, cache_key)
-
-        response = _irail_get_liveboard(station_name, language, last_etag)
-
-        if response.status_code == 304:
-            return {
-                "status": "skipped",
-                "message": "No new data (304)",
-                "rows_inserted": 0,
-                "rows_skipped": 0,
-                "etag_saved": False,
-            }
-
-        if response.status_code != 200:
-            raise RuntimeError(f"iRail error {response.status_code}: {response.text}")
-
-        new_etag = response.headers.get("Etag") or response.headers.get("ETag")
-        if new_etag:
-            _upsert_etag(cur, cache_key, new_etag)
-
-        payload = response.json()
-
-        board_station_name = payload.get("station") or station_name
-        stationinfo = payload.get("stationinfo") or {}
-        station_id = stationinfo.get("id")
-        station_uri = stationinfo.get("@id")
-
-        departures = ((payload.get("departures") or {}).get("departure")) or []
-        if not isinstance(departures, list):
-            departures = []
-
-        rows_inserted = 0
-        rows_skipped = 0
-
-        for d in departures:
-            scheduled_time_utc = _epoch_to_utc_naive(d.get("time"))
-            delay_seconds = max(0, int(d.get("delay") or 0))
-
-            is_delayed = 1 if delay_seconds > 0 else 0
-            realtime_time_utc = scheduled_time_utc + dt.timedelta(seconds=delay_seconds)
-
-            raw_cancel = d.get("canceled")
-            if raw_cancel is None:
-                raw_cancel = d.get("isCanceled")
-            is_cancelled = _parse_boolish(raw_cancel)
-
-            platform = d.get("platform")
-            if isinstance(platform, dict):
-                platform = platform.get("name") or platform.get("normal")
-
-            vehicle_id = d.get("vehicle")
-            train_type = _train_type_from_vehicle_id(vehicle_id)
-
-            vehicleinfo = d.get("vehicleinfo") or {}
-            vehicle_uri = vehicleinfo.get("@id")
-            if not vehicle_uri and isinstance(vehicle_id, str) and vehicle_id.startswith("http"):
-                vehicle_uri = vehicle_id
-
-            destination_name = d.get("station")
-            destinfo = d.get("stationinfo") or {}
-            destination_id = destinfo.get("id")
-            destination_uri = destinfo.get("@id")
-
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO dbo.DepartureFact
-                    (station_name, station_id, station_uri,
-                     scheduled_time_utc, delay_seconds, platform,
-                     vehicle_id, vehicle_uri, train_type,
-                     destination_name, destination_id, destination_uri,
-                     is_delayed, is_cancelled, realtime_time_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    board_station_name, station_id, station_uri,
-                    scheduled_time_utc, delay_seconds, platform,
-                    vehicle_id, vehicle_uri, train_type,
-                    destination_name, destination_id, destination_uri,
-                    is_delayed, is_cancelled, realtime_time_utc
-                )
-                rows_inserted += 1
-            except Exception:
-                rows_skipped += 1
-
-        conn.commit()
-
-        return {
-            "status": "success",
-            "station": station_name,
-            "departures_received": len(departures),
-            "rows_inserted": rows_inserted,
-            "rows_skipped": rows_skipped,
-            "etag_saved": bool(new_etag),
-        }
+def _set_state(cur: pyodbc.Cursor, key: str, value: str) -> None:
+    cur.execute(
+        """
+        MERGE dbo.PipelineState AS t
+        USING (SELECT ? AS state_key, ? AS state_value) AS s
+        ON t.state_key = s.state_key
+        WHEN MATCHED THEN
+          UPDATE SET state_value = s.state_value, updated_at_utc = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+          INSERT (state_key, state_value) VALUES (s.state_key, s.state_value);
+        """,
+        key, value
+    )
 
 
 # ----------------------------
-# Shared ingestion logic: StationDim
+# Shared ingestion logic: StationDim (full refresh)
 # ----------------------------
 def run_stationdim_sync(language: str) -> dict:
-    logging.info("Syncing StationDim (stations endpoint) [%s]", language)
+    logging.info("Syncing StationDim [%s]", language)
 
     response = _irail_get_stations(language)
     if response.status_code != 200:
         raise RuntimeError(f"iRail stations error {response.status_code}: {response.text}")
 
     payload = response.json()
-
     stations = payload.get("station", [])
     if not isinstance(stations, list):
         stations = []
 
     rows_upserted = 0
-
     with _get_sql_connection() as conn:
         cur = conn.cursor()
 
@@ -325,42 +261,178 @@ def run_stationdim_sync(language: str) -> dict:
 
         conn.commit()
 
-    return {
-        "status": "success",
-        "stations_received": len(stations),
-        "rows_upserted": rows_upserted,
-        "lang": language,
-    }
+    return {"status": "success", "stations_received": len(stations), "rows_upserted": rows_upserted, "lang": language}
+
+
+def _get_all_belgian_station_names_from_dim(cur: pyodbc.Cursor) -> list[str]:
+    """
+    We treat StationDim as the source of Belgian stations.
+    iRail stations endpoint is Belgian rail, so this should be all you need.
+    We'll call liveboard using StationDim.name (or standard_name).
+    """
+    # Prefer standard_name if present, fallback to name
+    cur.execute(
+        """
+        SELECT
+          COALESCE(NULLIF(standard_name, ''), name) AS station_name
+        FROM dbo.StationDim
+        WHERE COALESCE(NULLIF(standard_name, ''), name) IS NOT NULL
+        ORDER BY station_name;
+        """
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+# ----------------------------
+# Shared ingestion logic: DepartureFact (single station)
+# ----------------------------
+def run_liveboard_sync(station_name: str, language: str, cur: pyodbc.Cursor) -> dict:
+    cache_key = _cache_key_liveboard(station_name, language)
+    last_etag = _get_cached_etag(cur, cache_key)
+
+    response = _irail_get_liveboard(station_name, language, last_etag)
+
+    if response.status_code == 304:
+        return {"status": "skipped", "station": station_name, "rows_inserted": 0, "rows_skipped": 0, "etag_saved": False}
+
+    if response.status_code != 200:
+        return {"status": "error", "station": station_name, "error": f"{response.status_code}", "rows_inserted": 0, "rows_skipped": 0}
+
+    new_etag = response.headers.get("Etag") or response.headers.get("ETag")
+    if new_etag:
+        _upsert_etag(cur, cache_key, new_etag)
+
+    payload = response.json()
+
+    board_station_name = payload.get("station") or station_name
+    stationinfo = payload.get("stationinfo") or {}
+    station_id = stationinfo.get("id")
+    station_uri = stationinfo.get("@id")
+
+    departures = ((payload.get("departures") or {}).get("departure")) or []
+    if not isinstance(departures, list):
+        departures = []
+
+    rows_inserted = 0
+    rows_skipped = 0
+
+    for d in departures:
+        scheduled_time_utc = _epoch_to_utc_naive(d.get("time"))
+        delay_seconds = max(0, int(d.get("delay") or 0))
+
+        is_delayed = 1 if delay_seconds > 0 else 0
+        realtime_time_utc = scheduled_time_utc + dt.timedelta(seconds=delay_seconds)
+
+        raw_cancel = d.get("canceled")
+        if raw_cancel is None:
+            raw_cancel = d.get("isCanceled")
+        is_cancelled = _parse_boolish(raw_cancel)
+
+        platform = d.get("platform")
+        if isinstance(platform, dict):
+            platform = platform.get("name") or platform.get("normal")
+
+        vehicle_id = d.get("vehicle")
+        train_type = _train_type_from_vehicle_id(vehicle_id)
+
+        vehicleinfo = d.get("vehicleinfo") or {}
+        vehicle_uri = vehicleinfo.get("@id")
+        if not vehicle_uri and isinstance(vehicle_id, str) and vehicle_id.startswith("http"):
+            vehicle_uri = vehicle_id
+
+        destination_name = d.get("station")
+        destinfo = d.get("stationinfo") or {}
+        destination_id = destinfo.get("id")
+        destination_uri = destinfo.get("@id")
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO dbo.DepartureFact
+                (station_name, station_id, station_uri,
+                 scheduled_time_utc, delay_seconds, platform,
+                 vehicle_id, vehicle_uri, train_type,
+                 destination_name, destination_id, destination_uri,
+                 is_delayed, is_cancelled, realtime_time_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                board_station_name, station_id, station_uri,
+                scheduled_time_utc, delay_seconds, platform,
+                vehicle_id, vehicle_uri, train_type,
+                destination_name, destination_id, destination_uri,
+                is_delayed, is_cancelled, realtime_time_utc
+            )
+            rows_inserted += 1
+        except Exception:
+            rows_skipped += 1
+
+    return {"status": "success", "station": station_name, "departures_received": len(departures),
+            "rows_inserted": rows_inserted, "rows_skipped": rows_skipped, "etag_saved": bool(new_etag)}
+
+
+# ----------------------------
+# Batch: process stations with cursor
+# ----------------------------
+def run_departurefact_batch(language: str, batch_size: int) -> dict:
+    """
+    Processes a batch of stations from StationDim each run.
+    This is the safe way to cover ALL stations while respecting iRail limits.
+    """
+    with _get_sql_connection() as conn:
+        cur = conn.cursor()
+
+        stations = _get_all_belgian_station_names_from_dim(cur)
+        if not stations:
+            return {"status": "error", "message": "StationDim is empty. Run StationDim sync first."}
+
+        offset = int(_get_state(cur, "departure_batch_offset", "0"))
+        total = len(stations)
+
+        # Build batch slice and next offset
+        batch = stations[offset: offset + batch_size]
+        next_offset = offset + len(batch)
+        if next_offset >= total:
+            next_offset = 0
+
+        inserted = 0
+        skipped = 0
+        errors = 0
+
+        for st in batch:
+            res = run_liveboard_sync(st, language, cur)
+            if res.get("status") == "success":
+                inserted += int(res.get("rows_inserted", 0))
+                skipped += int(res.get("rows_skipped", 0))
+            elif res.get("status") == "skipped":
+                # 304 Not Modified: no inserts
+                pass
+            else:
+                errors += 1
+
+        _set_state(cur, "departure_batch_offset", str(next_offset))
+        conn.commit()
+
+        return {
+            "status": "success",
+            "stations_total": total,
+            "stations_processed": len(batch),
+            "batch_offset_start": offset,
+            "batch_offset_next": next_offset,
+            "rows_inserted": inserted,
+            "rows_skipped": skipped,
+            "stations_errors": errors,
+            "rps": REQUESTS_PER_SECOND,
+        }
 
 
 # ----------------------------
 # TIMER TRIGGERS
 # ----------------------------
 
-# Departures: every 10 minutes (UTC)
-@app.schedule(schedule="0 */10 * * * *", arg_name="t1", run_on_startup=False, use_monitor=True)
-def TimerDepartureFact(t1: func.TimerRequest) -> None:
-    station = os.environ.get("IRAIL_STATION", "Gent-Sint-Pieters")
+# Stations update: weekly Sunday 03:00 UTC
+@app.schedule(schedule="0 0 3 * * 0", arg_name="t_st", run_on_startup=False, use_monitor=True)
+def TimerStationDim(t_st: func.TimerRequest) -> None:
     lang = os.environ.get("IRAIL_LANG", "en")
-
-    if t1.past_due:
-        logging.warning("Departure timer is running late (past_due=True).")
-
-    try:
-        result = run_liveboard_sync(station, lang)
-        logging.info("Departure timer result: %s", result)
-    except Exception:
-        logging.exception("Departure timer failed")
-
-
-# Stations: weekly on Sunday 03:00 UTC
-@app.schedule(schedule="0 0 3 * * 0", arg_name="t2", run_on_startup=False, use_monitor=True)
-def TimerStationDim(t2: func.TimerRequest) -> None:
-    lang = os.environ.get("IRAIL_LANG", "en")
-
-    if t2.past_due:
-        logging.warning("StationDim timer is running late (past_due=True).")
-
     try:
         result = run_stationdim_sync(lang)
         logging.info("StationDim timer result: %s", result)
@@ -368,30 +440,38 @@ def TimerStationDim(t2: func.TimerRequest) -> None:
         logging.exception("StationDim timer failed")
 
 
-# ----------------------------
-# HTTP TRIGGERS (manual run)
-# ----------------------------
-
-@app.route(route="FetchLiveboardToSql", auth_level=func.AuthLevel.FUNCTION)
-def FetchLiveboardToSql(req: func.HttpRequest) -> func.HttpResponse:
-    station = req.params.get("station") or os.environ.get("IRAIL_STATION", "Gent-Sint-Pieters")
-    lang = req.params.get("lang") or os.environ.get("IRAIL_LANG", "en")
-
+# Departures: every 10 minutes, process a batch of stations
+@app.schedule(schedule="0 */10 * * * *", arg_name="t_dep", run_on_startup=False, use_monitor=True)
+def TimerDepartureFactAllStations(t_dep: func.TimerRequest) -> None:
+    lang = os.environ.get("IRAIL_LANG", "en")
     try:
-        result = run_liveboard_sync(station, lang)
-        return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
-    except Exception as ex:
-        logging.exception("Manual departure sync failed")
-        return func.HttpResponse(f"Manual departure sync failed: {ex}", status_code=500)
+        result = run_departurefact_batch(lang, BATCH_SIZE)
+        logging.info("Departure batch timer result: %s", result)
+    except Exception:
+        logging.exception("Departure batch timer failed")
 
 
+# ----------------------------
+# HTTP TRIGGERS (manual)
+# ----------------------------
 @app.route(route="LoadStations", auth_level=func.AuthLevel.FUNCTION)
 def LoadStations(req: func.HttpRequest) -> func.HttpResponse:
     lang = req.params.get("lang") or os.environ.get("IRAIL_LANG", "en")
-
     try:
         result = run_stationdim_sync(lang)
-        return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
+        return func.HttpResponse(json.dumps(result), mimetype="application/json")
     except Exception as ex:
         logging.exception("Manual StationDim sync failed")
         return func.HttpResponse(f"Manual StationDim sync failed: {ex}", status_code=500)
+
+
+@app.route(route="RunDepartureBatch", auth_level=func.AuthLevel.FUNCTION)
+def RunDepartureBatch(req: func.HttpRequest) -> func.HttpResponse:
+    lang = req.params.get("lang") or os.environ.get("IRAIL_LANG", "en")
+    batch_size = int(req.params.get("batch_size") or BATCH_SIZE)
+    try:
+        result = run_departurefact_batch(lang, batch_size)
+        return func.HttpResponse(json.dumps(result), mimetype="application/json")
+    except Exception as ex:
+        logging.exception("Manual departure batch failed")
+        return func.HttpResponse(f"Manual departure batch failed: {ex}", status_code=500)
